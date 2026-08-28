@@ -1,0 +1,17 @@
+# Virtual environment
+.venv/
+__pycache__/
+*.py[cod]
+
+# RMI source data — download from utilitytransitionhub.rmi.org (see README)
+data/
+
+# Built DuckDB database — rebuilt from CSVs on first run
+*.duckdb
+
+.DS_Store
+
+# Secrets
+.env
+.env.*
+!.env.example

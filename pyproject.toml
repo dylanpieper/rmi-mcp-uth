@@ -1,0 +1,25 @@
+[project]
+name = "rmi-mcp-uth"
+version = "0.1.0"
+description = "MCP server exposing RMI Utility Transition Hub data via DuckDB"
+readme = "README.md"
+authors = [
+    { name = "Dylan Pieper", email = "dylanpieper@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "duckdb>=1.5.5",
+    "fastmcp>=3.4.7",
+    "pandas>=3.0.5",
+    "pymupdf>=1.28.2",
+]
+
+[project.scripts]
+rmi-mcp-uth = "rmi_mcp_uth:main"
+
+[build-system]
+requires = ["uv_build>=0.12.6,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "rmi_mcp_uth"
