@@ -3,17 +3,27 @@
 import pymupdf
 
 from .config import DATA_DIR, mcp
+from .db import get_db
 
 
 @mcp.resource("rmi://data-dictionary")
 def data_dictionary() -> str:
     """Overview of the RMI Utility Transition Hub datasets and key columns."""
-    return """
+    # Read the span off the data rather than stating it: a data refresh moves
+    # both ends, and a frozen year here would be quoted back as fact.
+    first, last, horizon = get_db().execute(
+        """
+        SELECT min(year), max(year) FILTER (WHERE emissions_co2_historical IS NOT NULL),
+               max(year)
+        FROM emissions_targets
+        """
+    ).fetchone()
+    return f"""
     RMI Utility Transition Hub — Data Overview
     ===========================================
     Source: https://utilitytransitionhub.rmi.org/data-download/
     License: CC BY 4.0
-    Coverage: historical 2005-2024; emissions targets and 1.5C pathway to 2035.
+    Coverage: measured data {first}-{last}; targets and 1.5C pathway to {horizon}.
 
     Join keys — there is no single key across all tables
     ----------------------------------------------------
@@ -31,17 +41,30 @@ def data_dictionary() -> str:
     ----------
     1. emissions_targets carries separate 'owned' and 'delivered' row sets for
        each utility-year. Filter owned_delivered, or you double-count.
+       They are two attribution boundaries over different quantities, not a
+       subset and a superset: 'owned' is Scope 1 from the plants the utility
+       owns, whoever consumes the power; 'delivered' is what is attributed to
+       the power it sells, whoever generated it. Delivered is NOT owned plus
+       purchases, and is lower wherever a utility generates more than it sells
+       and moves the surplus wholesale. Neither is derivable from the other,
+       and many utilities carry only one — a utility that owns no generation
+       has no 'owned' rows at all. RMI's data dictionary and methodology PDFs
+       predate this column and document only the owned, Scope 1 side; 'basis'
+       is this server's parameter name for the choice, not RMI's term.
     2. operations_emissions_by_tech carries owned generation AND non-owned
        supply (wholesale purchases, net exchanges, wheeled power, energy
        efficiency, demand response, and negative transmission losses).
        Filter `owned_energy_source` for generation; split on energy_source
        to see supply.
     3. A jointly owned utility is split across parents, one row set per owner,
-       pro-rated by ownership share. Duke Energy Indiana appears under both
-       'Duke Energy Corp.' (80.1%) and 'Singapore' (GIC's 19.9% stake), the
-       same 53 generators on each side. Summing by utility_name is correct;
-       `WHERE parent_name = 'Duke Energy Corp.'` silently drops a fifth of
-       Duke Indiana. Aggregate by utility_name, or sum every parent row.
+       pro-rated by ownership share — the same generators appear once per
+       owner, each row carrying that owner's fraction. A minority owner may be
+       a holding company or a foreign investor that shares no name with the
+       utility. Filtering to one parent_name therefore drops the other owners'
+       shares and understates the utility. Aggregate by utility_name, or sum
+       every parent row. utility_state_map needs the same care: join it on
+       parent_name as well as utility_id_eia, or each owner picks up the
+       others' capacity.
     4. The 1.5C pathway is anchored to each utility's OWN 2005 emissions
        intensity, so benchmarks are not comparable across utilities. A
        restructured wires-only utility whose 2005 default supply was nuclear

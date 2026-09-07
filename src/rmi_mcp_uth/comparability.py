@@ -2,17 +2,31 @@
 
 # RMI anchors each utility's 1.5C pathway to that utility's own 2005 emissions
 # intensity. For a vertically integrated utility burning coal in 2005 the
-# benchmark is a large number and the gap to it means something. For a
-# restructured wires-only utility whose 2005 default supply happened to be
-# nuclear, the benchmark starts near zero and decays toward it, so buying
-# ordinary grid power reads as a several-hundred-percent overshoot. PECO is the
-# extreme: 76 kg/MWh in 2005 against a fleet median of 774, a 43 kg/MWh
-# benchmark in 2024, and a 698% "overshoot" that describes PJM's generation mix
-# rather than anything PECO owns or decided.
+# benchmark is a large number and the gap to it means something. For a utility
+# whose 2005 default supply was already low-carbon, the benchmark starts near
+# zero and decays toward it, so buying ordinary grid power reads as a
+# several-hundred-percent overshoot of a fleet it does not own and did not
+# choose. The flags below mark the utility-years where that comparison breaks
+# down.
 #
-# These flags mark the utility-years where that comparison breaks down. They are
-# deliberately narrow — of the 176 utilities with 2024 delivered data, 6 have a
-# pathway intensity under 100 kg/MWh and 4 a 2005 baseline under 150.
+# They are deliberately narrow. Measured on the current data snapshot: of 164
+# utilities with 2024 delivered data, 5 carry a pathway intensity under 100
+# kg/MWh and 4 a 2005 baseline under 150, against a fleet median 2005 intensity
+# of 653 kg/MWh. Those four, with 2005 intensity, 2024 benchmark, and the
+# percentage overshoot the benchmark produces:
+#
+#   Peco Energy Co.               76 -> 43 kg/MWh    698%
+#   Niagara Mohawk Power Corp.   129 -> 73 kg/MWh    203%
+#   Green Mountain Power Corp.   120 -> 67 kg/MWh    141%
+#   PUD No 2 of Grant County      98 -> 55 kg/MWh     43%
+#
+# The overshoot describes the regional grid mix these utilities buy from, not a
+# fleet they operate. Utilities with a high 2005 baseline can sit well above the
+# pathway too, and that is a real finding rather than an artifact, so the flags
+# key on the baseline rather than on the overshoot.
+
+from .entities import COMPOSITE_SEPARATORS
+from .helpers import intensity_kg_mwh
 
 _BASELINE_YEAR = 2005
 _LOW_BASELINE_KG_MWH = 150.0
@@ -30,9 +44,10 @@ CAVEATS = {
         "decarbonize."
     ),
     "low_baseline": (
-        f"2005 emissions intensity was under {_LOW_BASELINE_KG_MWH:.0f} kg/MWh "
-        f"(fleet median ~770). The pathway ramps down from that anchor, so the "
-        f"benchmark is near zero and percentage overshoot is unstable."
+        f"2005 emissions intensity was under {_LOW_BASELINE_KG_MWH:.0f} kg/MWh, "
+        f"far below a typical fossil-heavy fleet. The pathway ramps down from "
+        f"that anchor, so the benchmark is near zero and percentage overshoot "
+        f"is unstable."
     ),
     "low_pathway_intensity": (
         f"The 1.5C benchmark for this year is under {_LOW_PATHWAY_KG_MWH:.0f} "
@@ -54,7 +69,27 @@ CAVEATS = {
         "Net generation is zero, negative, or missing for this year, so "
         "intensity is undefined."
     ),
+    "joint_filing": (
+        "Several operating utilities file one IRP together, so this row covers "
+        "a larger fleet than a single utility does. Ranked against single "
+        "utilities it competes partly on being more than one of them, and its "
+        "components are carried separately in the operations tables."
+    ),
 }
+
+
+def _joint_filing_predicate(column: str) -> str:
+    """SQL truth test for a name that joins several entities into one filing.
+
+    Read off the name rather than a list of known entities, so a new joint
+    filer is caught without a code change. Shares COMPOSITE_SEPARATORS with
+    entities.py, which splits the same names into their components.
+    """
+    # Separators carry their own surrounding spaces on purpose: bare "and" is a
+    # substring of ordinary place names.
+    return " OR ".join(
+        f"{column} LIKE '%{sep}%'" for sep in COMPOSITE_SEPARATORS
+    )
 
 
 def comparability_cte() -> str:
@@ -65,6 +100,7 @@ def comparability_cte() -> str:
     pro-rated row set per owner, so reading a single parent's row as the
     utility's total understates it (see trap 3 in the data dictionary).
     """
+    joint = _joint_filing_predicate("s.utility_name_irp")
     return f"""
     targets_by_utility AS (
         SELECT
@@ -81,9 +117,8 @@ def comparability_cte() -> str:
     basis_series AS (
         SELECT
             *,
-            CASE WHEN mwh > 0 THEN co2 * 1e9 / mwh END AS kg_mwh,
-            CASE WHEN mwh_1point5c > 0
-                 THEN co2_1point5c * 1e9 / mwh_1point5c END AS pathway_kg_mwh
+            {intensity_kg_mwh("co2", "mwh")} AS kg_mwh,
+            {intensity_kg_mwh("co2_1point5c", "mwh_1point5c")} AS pathway_kg_mwh
         FROM targets_by_utility
     ),
     owned_co2 AS (
@@ -149,7 +184,9 @@ def comparability_cte() -> str:
                 CASE WHEN br.series_break = 1 THEN 'series_break' END,
                 CASE WHEN br.load_shift = 1 THEN 'load_base_shift' END,
                 CASE WHEN s.co2 IS NOT NULL AND coalesce(s.mwh, 0) <= 0
-                     THEN 'invalid_generation' END
+                     THEN 'invalid_generation' END,
+                CASE WHEN {joint}
+                     THEN 'joint_filing' END
             ], x -> x IS NOT NULL) AS comparability_flags
         FROM basis_series s
         LEFT JOIN owned_co2 o
