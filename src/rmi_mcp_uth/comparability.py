@@ -30,9 +30,10 @@ CAVEATS = {
         "decarbonize."
     ),
     "low_baseline": (
-        f"2005 emissions intensity was under {_LOW_BASELINE_KG_MWH:.0f} kg/MWh "
-        f"(fleet median ~770). The pathway ramps down from that anchor, so the "
-        f"benchmark is near zero and percentage overshoot is unstable."
+        f"2005 emissions intensity was under {_LOW_BASELINE_KG_MWH:.0f} kg/MWh, "
+        f"far below a typical fossil-heavy fleet. The pathway ramps down from "
+        f"that anchor, so the benchmark is near zero and percentage overshoot "
+        f"is unstable."
     ),
     "low_pathway_intensity": (
         f"The 1.5C benchmark for this year is under {_LOW_PATHWAY_KG_MWH:.0f} "

@@ -28,15 +28,36 @@ from .names import (
     name_rank_params,
     name_suggestions,
 )
+from .response import fail, note, respond
 
 
 
 
 @mcp.tool
-def list_tables() -> list[dict]:
+def list_tables() -> dict:
     """List all tables with their column names and types.
 
     Call this first to understand what data is available before querying.
+
+    Every tool on this server returns the same envelope:
+      rows   — the data; every row carries the same keys, and warnings and
+               errors are never mixed in among them
+      units  — the unit of each column that has one ("MMT CO2", "TWh", "GW",
+               "kg CO2/MWh", "USD"); columns absent from it are unitless
+      meta   — `grain` lists the columns that together identify one row, so you
+               can tell whether adding rows up double-counts (null where the
+               caller wrote the shape); name searches add
+               matched_utilities. Whether a column may be added at all is a
+               separate question, answered by `non_additive` — the columns in
+               this result that must never be summed across rows. Most are
+               rates, to be recomputed from the two totals underneath them; one
+               is plain MW that still cannot be summed. Read that list rather
+               than guessing from the unit.
+      notes  — whole-response warnings, each with a `kind`: projection,
+               excluded_by_default, not_comparable, below_min_emissions,
+               truncated. Read these before quoting a number.
+      error  — null, or a message plus fields naming how to narrow the request.
+               When it is set, rows is empty.
     """
     db = get_db()
     tables = [row[0] for row in db.execute("SHOW TABLES").fetchall()]
@@ -51,11 +72,11 @@ def list_tables() -> list[dict]:
                 "row_count": row_count,
             }
         )
-    return result
+    return respond(result, grain=["table"])
 
 
 @mcp.tool
-def preview_table(table_name: str, limit: int = 5) -> list[dict]:
+def preview_table(table_name: str, limit: int = 5) -> dict:
     """Show the first few rows of a table to understand its structure.
 
     Use this after list_tables to see what the actual data looks like.
@@ -64,30 +85,45 @@ def preview_table(table_name: str, limit: int = 5) -> list[dict]:
     db = get_db()
     known = {row[0] for row in db.execute("SHOW TABLES").fetchall()}
     if table_name not in known:
-        return [{"error": f"Unknown table '{table_name}'. Use list_tables()."}]
+        return fail(f"Unknown table '{table_name}'. Use list_tables().")
     df = db.execute(
         f'SELECT * FROM "{table_name}" LIMIT ?', [max(1, min(limit, 20))]
     ).fetchdf()
-    return df.to_dict(orient="records")
+    # Raw table rows: preview_table does not aggregate, so there is no key to
+    # promise — a table may repeat any combination of its columns.
+    return respond(df, grain=None)
 
 
 @mcp.tool
 def list_utilities(
     state_abbr: str = "", name_contains: str = "", limit: int = 100
-) -> list[dict]:
+) -> dict:
     """List utilities, optionally filtered by two-letter state code (e.g. 'CO', 'TX').
 
     Returns utility and parent names, EIA/FERC1 IDs, RMI utility type, and — when
-    a state is given — the capacity that utility owns in that state (MW), largest
-    first. `name_contains` additionally filters on utility or parent name
+    a state is given — how much generating capacity it owns there, largest first.
+    `name_contains` additionally filters on utility or parent name
     (case-insensitive substring).
+
+    Two capacity columns, and they are not interchangeable:
+      capacity_owned_mw        the utility's OWN share, pro-rated by ownership
+                               fraction, on the same basis as get_generation_mix.
+                               This is the sort key. Null where the utility owns
+                               no generation in the state.
+      capacity_owned_in_state  RMI's own figure, carried through unchanged. It
+                               is documented at plant level, runs several times
+                               higher than the ownership share, and summed over
+                               a state's utilities exceeds that state's real
+                               capacity. Do not sum it and do not read it as
+                               owned MW; prefer capacity_owned_mw.
+
     Use this to find the right utility name before pulling emissions or generation data.
     """
     db = get_db()
     limit = max(1, min(limit, 500))
 
     name_columns = ["u.utility_name", "u.parent_name"]
-    rank_select, rank_order, rank_params, name_where, name_params = "", "", [], "", []
+    rank_select, rank_order, rank_params, name_where, name_args = "", "", [], "", []
     # Without a state there is no size signal to sort by, and a parent name ties
     # dozens of rows at the same rank. Filing a FERC Form 1 separates operating
     # utilities from the project LLCs that share their name.
@@ -96,10 +132,39 @@ def list_utilities(
         rank_order = "match_rank, "
         rank_params = name_rank_params(name_contains)
         name_where = f"AND ({name_predicate(name_columns)})"
-        name_params = name_params(name_columns, name_contains)
+        # Bound to name_args, not name_params: assigning the imported helper's
+        # name here would make it a local for the whole function and shadow the
+        # call on this very line.
+        name_args = name_params(name_columns, name_contains)
 
     if state_abbr:
+        # Ranking runs on the pro-rated share, not on capacity_owned_in_state.
+        # RMI documents that column at plant level and states the "multiplied by
+        # ownership fractions" step for every other capacity metric but not for
+        # it. Measured, it runs 2x to 15x above the pro-rated share within a
+        # single state, and summed across a state's utilities it exceeds that
+        # state's real capacity several times over. The exact basis is not
+        # recoverable from the published files; what is certain is that it is
+        # not the ownership share, so ordering by it does not rank utilities by
+        # how much generation they own.
         sql = f"""
+            WITH owned AS (
+                -- Grouped by parent as well: operations splits a jointly owned
+                -- utility across its owners, pro-rated, exactly as
+                -- utility_state_map does. Summing without the parent would hand
+                -- every owner the utility's whole figure.
+                SELECT utility_id_eia, parent_name, state AS state_abbr, year,
+                       sum(year_end_capacity) * 1000 AS capacity_owned_mw
+                FROM operations_emissions_by_tech
+                WHERE owned_energy_source
+                GROUP BY ALL
+            ),
+            owned_latest AS (
+                SELECT utility_id_eia, parent_name, state_abbr,
+                       max_by(capacity_owned_mw, year) AS capacity_owned_mw
+                FROM owned
+                GROUP BY ALL
+            )
             SELECT
                 u.utility_name,
                 u.parent_name,
@@ -108,17 +173,29 @@ def list_utilities(
                 u.utility_type_rmi,
                 m.state_abbr,
                 max(m.year) AS latest_year,
-                max_by(m.capacity_owned_in_state, m.year) AS capacity_owned_in_state_mw
+                any_value(o.capacity_owned_mw) AS capacity_owned_mw,
+                max_by(m.capacity_owned_in_state, m.year) AS capacity_owned_in_state
                 {rank_select}
             FROM utility_information u
-            JOIN utility_state_map m USING (utility_id_eia)
+            -- Joined on the parent as well as the utility: a jointly owned
+            -- utility carries one row per owner in both tables, pro-rated by
+            -- ownership share. On utility_id_eia alone every owner's row sees
+            -- every other owner's capacity, and max_by hands each of them the
+            -- largest share instead of its own.
+            JOIN utility_state_map m
+              ON m.utility_id_eia = u.utility_id_eia
+             AND m.parent_name IS NOT DISTINCT FROM u.parent_name
+            LEFT JOIN owned_latest o
+              ON o.utility_id_eia = u.utility_id_eia
+             AND o.parent_name IS NOT DISTINCT FROM u.parent_name
+             AND o.state_abbr = m.state_abbr
             WHERE UPPER(m.state_abbr) = UPPER(?)
             {name_where}
             GROUP BY ALL
-            ORDER BY {rank_order} capacity_owned_in_state_mw DESC NULLS LAST, u.utility_name
+            ORDER BY {rank_order} capacity_owned_mw DESC NULLS LAST, u.utility_name
             LIMIT ?
         """
-        params = [*rank_params, state_abbr, *name_params, limit]
+        params = [*rank_params, state_abbr, *name_args, limit]
     else:
         sql = f"""
             SELECT DISTINCT
@@ -134,7 +211,7 @@ def list_utilities(
             ORDER BY {rank_order} u.utility_id_ferc1 IS NULL, u.utility_name
             LIMIT ?
         """
-        params = [*rank_params, *name_params, limit]
+        params = [*rank_params, *name_args, limit]
 
     df = db.execute(sql, params).fetchdf()
 
@@ -142,23 +219,34 @@ def list_utilities(
         suggestions = name_suggestions(
             "utility_information", ["utility_name", "parent_name"], name_contains
         )
-        note = "No utilities found. Try a different state code or name."
         if suggestions:
-            note = (
+            return fail(
                 "No utilities found. Did you mean: "
                 + ", ".join(repr(s) for s in suggestions)
-                + "?"
+                + "?",
+                suggestions=suggestions,
             )
-        return [{"note": note}]
+        return fail("No utilities found. Try a different state code or name.")
 
     # match_rank exists only to order the result; it is not data the caller wants.
     df = df.drop(columns=["match_rank"], errors="ignore")
-    out = df.to_dict(orient="records")
-    if len(out) == limit:
-        out.append(
-            {"note": f"Truncated to {limit} rows; raise `limit` or narrow the filter."}
+    notes = []
+    if len(df) == limit:
+        notes.append(
+            note(
+                "truncated",
+                f"Truncated to {limit} rows; raise `limit` or narrow the filter.",
+            )
         )
-    return out
+    # The parent belongs in the key: a jointly owned utility appears once per
+    # owner, carrying that owner's pro-rated share. Both id columns belong too
+    # — the same name and parent can carry two EIA ids, or two FERC1 ids.
+    key = ["utility_name", "parent_name", "utility_id_eia", "utility_id_ferc1"]
+    return respond(
+        df,
+        grain=[*key, "state_abbr"] if state_abbr else key,
+        notes=notes,
+    )
 
 
 @mcp.tool
@@ -167,7 +255,7 @@ def get_emissions_trend(
     basis: str = "delivered",
     start_year: int = 0,
     end_year: int = 0,
-) -> list[dict]:
+) -> dict:
     """Get yearly CO2 emissions and 1.5°C pathway comparison for a utility.
 
     Matches the utility's own name or its parent's, so "Xcel Energy" returns
@@ -186,15 +274,14 @@ def get_emissions_trend(
     The search is case-insensitive and supports partial names.
 
     Covers 2005-2035: measured emissions through 2024, stated targets and IRP
-    projections after that. The `source` column labels every row, and the
-    response header reports where the boundary falls. Narrow with start_year /
-    end_year (both inclusive, 0 means unbounded) — pass end_year=2024 for
-    history only.
+    projections after that. The `source` column labels every row, and `meta`
+    reports where the boundary falls. Narrow with start_year / end_year (both
+    inclusive, 0 means unbounded) — pass end_year=2024 for history only.
     """
     db = get_db()
     basis_row = basis_filter(basis)
     if basis_row is None:
-        return [{"error": "basis must be one of: delivered, owned, all"}]
+        return fail("basis must be one of: delivered, owned, all")
 
     year_filter, year_params = year_window(start_year, end_year)
 
@@ -231,21 +318,27 @@ def get_emissions_trend(
     ).fetchdf()
 
     if df.empty:
-        return [empty_targets_reason(utility_name, basis, start_year, end_year)]
+        return empty_targets_reason(utility_name, basis, start_year, end_year)
 
     oversized = oversized_targets(utility_name, df, basis)
     if oversized:
-        return [oversized]
+        return oversized
 
     matched = df["utility_name"].dropna().unique().tolist()
-    meta = matched_names_meta(utility_name, matched, len(df))
-    meta["_meta"].update(history_split(df))
+    meta = matched_names_meta(utility_name, matched)
+    split, notes = history_split(df)
+    meta.update(split)
     excluded = basis_excluded_note(
         db, utility_name, basis, year_filter, year_params, matched
     )
     if excluded:
-        meta["_meta"]["excluded_by_default"] = excluded
-    return [meta, *df.to_dict(orient="records")]
+        notes.append(excluded)
+    return respond(
+        df,
+        grain=["utility_name", "year", "owned_delivered"],
+        meta=meta,
+        notes=notes,
+    )
 
 
 @mcp.tool
@@ -254,18 +347,19 @@ def get_generation_mix(
     year: int = 0,
     include_purchases: bool = False,
     group_by: str = "utility",
-) -> list[dict]:
+) -> dict:
     """Get electricity generation breakdown by technology for a utility.
 
     Matches the utility's own name or its parent's. group_by="utility" (the
     default) returns one row per subsidiary and technology; group_by="technology"
-    sums across everything the name matched, which is what a parent-level
-    comparison wants — "Duke Energy" collapses from 41 rows to 8.
+    sums across everything the name matched into a single fleet, which is what
+    a parent-level comparison wants.
 
     The rollup sums over the matched set rather than grouping by parent_name,
-    which matters: RMI splits jointly owned utilities across parents (a 19.9%
-    stake in Duke Energy Indiana is filed under parent "Singapore"), so a
-    parent_name rollup would report Duke roughly 20% light.
+    which matters: RMI splits a jointly owned utility across its owners, one
+    pro-rated row set each, and a minority owner can be a company that shares
+    no name with the utility. Grouping by parent_name would drop those rows and
+    report the parent short by the other owners' shares.
 
     Shows capacity (GW), net generation (TWh), capacity factor, and CO2
     emissions (MMT) by RMI technology group (Coal, Gas, Wind, Solar, Nuclear,
@@ -281,13 +375,13 @@ def get_generation_mix(
     columns.
 
     The search is case-insensitive and supports partial names.
-    Optionally filter to a single year; defaults to all years (2005-2024).
+    Optionally filter to a single year; defaults to every year in the data.
     """
     db = get_db()
 
     group_by = group_by.strip().lower()
     if group_by not in ("utility", "technology"):
-        return [{"error": "group_by must be one of: utility, technology"}]
+        return fail("group_by must be one of: utility, technology")
 
     params: list = name_params(OPERATIONS_NAME_COLUMNS, utility_name)
     owned_filter = "" if include_purchases else "AND owned_energy_source"
@@ -352,19 +446,15 @@ def get_generation_mix(
                 )
 
             span = f"{low}" if year else f"{low}-{high}"
-            return [
-                {
-                    "error": (
-                        f"'{utility_name}' matches {matched_rows:,} rows "
-                        f"({utilities:,} utilities x {span} x technology), over the "
-                        f"{MAX_RESPONSE_ROWS}-row budget. Narrow it: "
-                        + "; ".join(options) + "."
-                    ),
-                    "matched_rows": matched_rows,
-                    "utilities": utilities,
-                    "years": [low, high],
-                }
-            ]
+            return fail(
+                f"'{utility_name}' matches {matched_rows:,} rows "
+                f"({utilities:,} utilities x {span} x technology), over the "
+                f"{MAX_RESPONSE_ROWS}-row budget. Narrow it: "
+                + "; ".join(options) + ".",
+                matched_rows=matched_rows,
+                utilities=utilities,
+                years=[low, high],
+            )
 
     if group_by == "technology":
         # year stays a grouping key so year=0 rolls up per year rather than
@@ -405,11 +495,9 @@ def get_generation_mix(
     ).fetchdf()
 
     if df.empty:
-        return [
-            no_name_match(
-                utility_name, "operations_emissions_by_tech", OPERATIONS_NAME_COLUMNS
-            )
-        ]
+        return no_name_match(
+            utility_name, "operations_emissions_by_tech", OPERATIONS_NAME_COLUMNS
+        )
 
     if "utility_name" in df.columns:
         matched = df["utility_name"].dropna().unique().tolist()
@@ -420,7 +508,8 @@ def get_generation_mix(
             db, "operations_emissions_by_tech", "utility_name", where_sql, params
         )
 
-    meta = matched_names_meta(utility_name, matched, len(df))
+    meta = matched_names_meta(utility_name, matched)
+    notes = []
     if not include_purchases:
         # A name can resolve to subsidiaries that own no generation at all —
         # every Exelon delivery utility, say. They are correctly absent from
@@ -440,8 +529,13 @@ def get_generation_mix(
             "include_purchases=True to include those rows.",
         )
         if excluded:
-            meta["_meta"]["excluded_by_default"] = excluded
-    return [meta, *df.to_dict(orient="records")]
+            notes.append(excluded)
+    grain = (
+        ["year", "technology_rmi"]
+        if group_by == "technology"
+        else ["utility_name", "parent_name", "year", "technology_rmi", "energy_source"]
+    )
+    return respond(df, grain=grain, meta=meta, notes=notes)
 
 
 @mcp.tool
@@ -450,7 +544,7 @@ def get_climate_alignment(
     basis: str = "delivered",
     start_year: int = 0,
     end_year: int = 0,
-) -> list[dict]:
+) -> dict:
     """Compare a utility's emissions to RMI's 1.5°C pathway, year by year.
 
     Matches the utility's own name or its parent's.
@@ -469,7 +563,7 @@ def get_climate_alignment(
     db = get_db()
     basis_row = basis_filter(basis)
     if basis_row is None:
-        return [{"error": "basis must be one of: delivered, owned, all"}]
+        return fail("basis must be one of: delivered, owned, all")
 
     year_filter, year_params = year_window(start_year, end_year)
 
@@ -538,36 +632,46 @@ def get_climate_alignment(
     ).fetchdf()
 
     if df.empty:
-        return [empty_targets_reason(utility_name, basis, start_year, end_year)]
+        return empty_targets_reason(utility_name, basis, start_year, end_year)
 
     oversized = oversized_targets(utility_name, df, basis)
     if oversized:
-        return [oversized]
+        return oversized
 
     matched = df["utility_name"].dropna().unique().tolist()
-    meta = matched_names_meta(utility_name, matched, len(df))
-    meta["_meta"].update(history_split(df))
+    meta = matched_names_meta(utility_name, matched)
+    split, notes = history_split(df)
+    meta.update(split)
     excluded = basis_excluded_note(
         db, utility_name, basis, year_filter, year_params, matched
     )
     if excluded:
-        meta["_meta"]["excluded_by_default"] = excluded
+        notes.append(excluded)
 
-    # DuckDB LIST comes back as a numpy array, which does not serialize to
-    # JSON — the MCP response fails validation whenever a flag is present.
     df["comparability_flags"] = df["comparability_flags"].apply(list)
 
     # Surfaced here as well as in rank_climate_alignment, so asking about one
     # utility raises the same caveat a ranking would have applied to it.
     caveats = caveat_notes([f for flags in df["comparability_flags"] for f in flags])
     if caveats:
-        meta["_meta"]["not_comparable"] = {
-            "reason": "The 1.5C comparison for this utility carries caveats.",
-            "caveats": caveats,
-        }
+        notes.append(
+            note(
+                "not_comparable",
+                "The 1.5C comparison for this utility carries caveats.",
+                caveats=caveats,
+            )
+        )
     else:
+        # Nothing to qualify, so the column is noise on every row. Dropping it
+        # keeps the response's own columns consistent — every row still carries
+        # the same keys, which is what a CSV writer needs.
         df = df.drop(columns=["comparability_flags"])
-    return [meta, *df.to_dict(orient="records")]
+    return respond(
+        df,
+        grain=["utility_name", "year", "owned_delivered"],
+        meta=meta,
+        notes=notes,
+    )
 
 
 _RANK_METRICS = {
@@ -585,13 +689,6 @@ _RANK_METRICS = {
 _EXCLUDING_FLAGS = frozenset(CAVEATS) - {"low_pathway_intensity"}
 
 
-def _clean(value):
-    """NaN out of pandas, None into JSON."""
-    if isinstance(value, float) and value != value:
-        return None
-    return value
-
-
 @mcp.tool
 def rank_climate_alignment(
     year: int = 0,
@@ -603,7 +700,7 @@ def rank_climate_alignment(
     include_flagged: bool = False,
     ascending: bool = False,
     limit: int = 20,
-) -> list[dict]:
+) -> dict:
     """Rank utilities or parents by how far they sit from RMI's 1.5C pathway.
 
     Returns absolute gap, percent over, and both intensities together — one
@@ -617,7 +714,7 @@ def rank_climate_alignment(
     `group_by` is 'utility' or 'parent'.
 
     Utilities whose pathway comparison is not meaningful are excluded by
-    default and named in the response header with the reason; under
+    default and named in `notes` with the reason; under
     group_by='parent' they are dropped before the parent is totalled, so one
     wires-only subsidiary cannot disqualify its whole parent. Pass
     include_flagged=True to rank them anyway; every row carries
@@ -629,23 +726,18 @@ def rank_climate_alignment(
 
     basis = basis.strip().lower()
     if basis not in ("delivered", "owned"):
-        return [
-            {
-                "error": "basis must be 'delivered' or 'owned'. 'all' would "
-                "double-count, since emissions_targets carries one row set per "
-                "accounting boundary."
-            }
-        ]
+        return fail(
+            "basis must be 'delivered' or 'owned'. 'all' would double-count, "
+            "since emissions_targets carries one row set per accounting boundary."
+        )
     if metric not in _RANK_METRICS:
-        return [
-            {
-                "error": f"metric must be one of: {', '.join(_RANK_METRICS)}.",
-                "metrics": _RANK_METRICS,
-            }
-        ]
+        return fail(
+            f"metric must be one of: {', '.join(_RANK_METRICS)}.",
+            metrics=_RANK_METRICS,
+        )
     group_by = group_by.strip().lower()
     if group_by not in ("utility", "parent"):
-        return [{"error": "group_by must be 'utility' or 'parent'."}]
+        return fail("group_by must be 'utility' or 'parent'.")
 
     limit = max(1, min(limit, 100))
     group_column = "utility_name_irp" if group_by == "utility" else "parent_name"
@@ -710,15 +802,12 @@ def rank_climate_alignment(
             "SELECT min(year), max(year) FROM emissions_targets WHERE owned_delivered = ?",
             [basis],
         ).fetchone()
-        return [
-            {
-                "error": (
-                    f"No {basis} rows for {year}"
-                    + (f" matching utility_type {utility_type!r}" if utility_type else "")
-                    + f". Data runs {low}-{high}."
-                )
-            }
-        ]
+        return fail(
+            f"No {basis} rows for {year}"
+            + (f" matching utility_type {utility_type!r}" if utility_type else "")
+            + f". Data runs {low}-{high}.",
+            available_years=[low, high],
+        )
 
     df["comparability_flags"] = df["comparability_flags"].apply(list)
     df["blocking"] = df["comparability_flags"].apply(
@@ -730,15 +819,11 @@ def rank_climate_alignment(
         df = df[~df["blocking"].apply(bool)]
 
     if df.empty:
-        return [
-            {
-                "error": (
-                    f"Every {basis} utility in {year} carries a comparability "
-                    f"flag. Pass include_flagged=True to rank them anyway."
-                ),
-                "flags": sorted({f for flags in flagged["blocking"] for f in flags}),
-            }
-        ]
+        return fail(
+            f"Every {basis} utility in {year} carries a comparability flag. "
+            f"Pass include_flagged=True to rank them anyway.",
+            flags=sorted({f for flags in flagged["blocking"] for f in flags}),
+        )
 
     grouped = df.groupby("name", as_index=False).agg(
         source=("source", lambda s: s.iloc[0] if s.nunique() == 1 else "mixed"),
@@ -787,7 +872,11 @@ def rank_climate_alignment(
     ranked = grouped.sort_values(
         metric, ascending=ascending, na_position="last"
     ).head(limit)
-    ranked = ranked.rename(columns={"name": group_column})
+    # Every other tool calls this column utility_name; a ranking is not a
+    # reason for the caller to key its join differently.
+    ranked = ranked.rename(
+        columns={"name": "utility_name" if group_by == "utility" else "parent_name"}
+    )
 
     meta = {
         "year": int(year),
@@ -797,22 +886,19 @@ def rank_climate_alignment(
         "group_by": group_by,
         "order": "ascending" if ascending else "descending",
         "candidates": int(candidates),
-        "ranked": int(len(ranked)),
     }
+    notes = []
     if (ranked["source"] != "historical").any():
-        meta["source_note"] = (
-            "Rows sourced from a stated target or IRP projection are plans, not "
-            "measured emissions. See the `source` column."
+        notes.append(
+            note(
+                "projection",
+                "Rows sourced from a stated target or IRP projection are plans, "
+                "not measured emissions. See the `source` column.",
+            )
         )
     if len(flagged):
-        note = {
+        detail = {
             "count": int(flagged["utility_name_irp"].nunique()),
-            "reason": (
-                "Excluded before the ranking; the 1.5C comparison is not "
-                "meaningful for these. Pass include_flagged=True to rank them."
-                if not include_flagged
-                else "Ranked, but the 1.5C comparison is not meaningful for these."
-            ),
             "utilities": sorted(flagged["utility_name_irp"].unique())[
                 :MAX_LISTED_MATCHES
             ],
@@ -821,31 +907,42 @@ def rank_climate_alignment(
             ),
         }
         if flagged["utility_name_irp"].nunique() > MAX_LISTED_MATCHES:
-            note["truncated"] = True
+            detail["truncated"] = True
         if group_by == "parent" and not include_flagged:
-            note["parent_totals_note"] = (
+            detail["parent_totals_note"] = (
                 "Parent totals cover only the subsidiaries that survived this "
                 "filter, so they understate the parent's full book. The "
                 "`utilities` column names what each total is built from."
             )
-        meta["not_comparable"] = note
+        notes.append(
+            note(
+                "not_comparable",
+                "Excluded before the ranking; the 1.5C comparison is not "
+                "meaningful for these. Pass include_flagged=True to rank them."
+                if not include_flagged
+                else "Ranked, but the 1.5C comparison is not meaningful for these.",
+                **detail,
+            )
+        )
     if below_floor:
-        meta["below_min_emissions"] = {
-            "count": below_floor,
-            "reason": f"Under min_emissions_mmt={min_emissions_mmt}.",
-        }
+        notes.append(
+            note(
+                "below_min_emissions",
+                f"Under min_emissions_mmt={min_emissions_mmt}.",
+                count=below_floor,
+            )
+        )
 
-    return [
-        {"_meta": meta},
-        *(
-            {k: _clean(v) for k, v in row.items()}
-            for row in ranked.to_dict(orient="records")
-        ),
-    ]
+    return respond(
+        ranked,
+        grain=["utility_name" if group_by == "utility" else "parent_name"],
+        meta=meta,
+        notes=notes,
+    )
 
 
 @mcp.tool
-def query_data(sql: str) -> list[dict]:
+def query_data(sql: str) -> dict:
     """Run a read-only SQL query against the database. DuckDB SQL syntax.
 
     Call list_tables() first to see available tables and columns.
@@ -885,27 +982,28 @@ def query_data(sql: str) -> list[dict]:
     try:
         statements = db.extract_statements(sql)
     except Exception as e:
-        return [{"error": f"Could not parse SQL: {e}"}]
+        return fail(f"Could not parse SQL: {e}")
 
     if len(statements) != 1:
-        return [
-            {"error": f"Send exactly one statement per call (got {len(statements)})."}
-        ]
+        return fail(f"Send exactly one statement per call (got {len(statements)}).")
     if statements[0].type != duckdb.StatementType.SELECT:
-        return [{"error": "Only SELECT queries are allowed."}]
+        return fail("Only SELECT queries are allowed.")
 
     try:
         df = db.execute(sql).fetchdf()
-        # Truncation is right here but wrong in the tools below: the caller
-        # wrote this ORDER BY, so the first rows are the ones it asked for.
-        if len(df) > MAX_RESPONSE_ROWS:
-            df = df.head(MAX_RESPONSE_ROWS)
-            return df.to_dict(orient="records") + [
-                {
-                    "note": f"Results truncated to {MAX_RESPONSE_ROWS} rows. "
-                    f"Add a LIMIT clause."
-                }
-            ]
-        return df.to_dict(orient="records")
     except Exception as e:
-        return [{"error": f"Query failed: {e}"}]
+        return fail(f"Query failed: {e}")
+
+    notes = []
+    # Truncation is right here but wrong in the tools above: the caller wrote
+    # this ORDER BY, so the first rows are the ones it asked for.
+    if len(df) > MAX_RESPONSE_ROWS:
+        df = df.head(MAX_RESPONSE_ROWS)
+        notes.append(
+            note(
+                "truncated",
+                f"Results truncated to {MAX_RESPONSE_ROWS} rows. Add a LIMIT clause.",
+            )
+        )
+    # Only the caller knows what its own GROUP BY produced.
+    return respond(df, grain=None, notes=notes)
