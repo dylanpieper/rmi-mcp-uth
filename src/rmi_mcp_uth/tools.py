@@ -15,6 +15,7 @@ from .helpers import (
     empty_targets_reason,
     excluded_note,
     history_split,
+    intensity_kg_mwh,
     matched_names_meta,
     no_name_match,
     oversized_targets,
@@ -32,6 +33,11 @@ from .names import (
 from .response import fail, note, respond
 
 
+# The columns that together identify one utility row. Declared as the grain and
+# used as the ordering tiebreaker, so the two cannot disagree: a jointly owned
+# utility carries one row per owner, and the same name and parent can carry two
+# EIA ids or two FERC1 ids.
+UTILITY_KEY = ["utility_name", "parent_name", "utility_id_eia", "utility_id_ferc1"]
 
 
 @mcp.tool
@@ -123,6 +129,11 @@ def list_utilities(
     db = get_db()
     limit = max(1, min(limit, 500))
 
+    # Ordering ends on the same columns the response declares as its grain, so
+    # the sort is total by construction: two rows can only tie if the grain is
+    # not a key, which the envelope already promises it is.
+    grain_order = ", ".join(f"u.{column}" for column in UTILITY_KEY)
+
     name_columns = ["u.utility_name", "u.parent_name"]
     rank_select, rank_order, rank_params, name_where, name_args = "", "", [], "", []
     # Without a state there is no size signal to sort by, and a parent name ties
@@ -193,7 +204,7 @@ def list_utilities(
             WHERE UPPER(m.state_abbr) = UPPER(?)
             {name_where}
             GROUP BY ALL
-            ORDER BY {rank_order} capacity_owned_mw DESC NULLS LAST, u.utility_name
+            ORDER BY {rank_order} capacity_owned_mw DESC NULLS LAST, {grain_order}
             LIMIT ?
         """
         params = [*rank_params, state_abbr, *name_args, limit]
@@ -209,7 +220,7 @@ def list_utilities(
             FROM utility_information u
             WHERE TRUE
             {name_where}
-            ORDER BY {rank_order} u.utility_id_ferc1 IS NULL, u.utility_name
+            ORDER BY {rank_order} u.utility_id_ferc1 IS NULL, {grain_order}
             LIMIT ?
         """
         params = [*rank_params, *name_args, limit]
@@ -239,13 +250,9 @@ def list_utilities(
                 f"Truncated to {limit} rows; raise `limit` or narrow the filter.",
             )
         )
-    # The parent belongs in the key: a jointly owned utility appears once per
-    # owner, carrying that owner's pro-rated share. Both id columns belong too
-    # — the same name and parent can carry two EIA ids, or two FERC1 ids.
-    key = ["utility_name", "parent_name", "utility_id_eia", "utility_id_ferc1"]
     return respond(
         df,
-        grain=[*key, "state_abbr"] if state_abbr else key,
+        grain=[*UTILITY_KEY, "state_abbr"] if state_abbr else UTILITY_KEY,
         notes=notes,
     )
 
@@ -304,16 +311,15 @@ def get_emissions_trend(
             emissions_co2_1point5c,
             net_generation_mwh / 1e6 AS net_generation_twh,
             net_generation_mwh_1point5c / 1e6 AS net_generation_twh_1point5c,
-            emissions_co2_historical * 1e9
-                / nullif(net_generation_mwh, 0) AS co2_intensity_kg_mwh,
-            emissions_co2_1point5c * 1e9
-                / nullif(net_generation_mwh_1point5c, 0)
+            {intensity_kg_mwh("emissions_co2_historical", "net_generation_mwh")}
+                AS co2_intensity_kg_mwh,
+            {intensity_kg_mwh("emissions_co2_1point5c", "net_generation_mwh_1point5c")}
                 AS co2_intensity_1point5c_kg_mwh
         FROM emissions_targets
         WHERE ({name_predicate(TARGET_NAME_COLUMNS)})
         {basis_row}
         {year_filter}
-        ORDER BY owned_delivered, year
+        ORDER BY owned_delivered, year, utility_name
     """,
         [*name_params(TARGET_NAME_COLUMNS, utility_name), *year_params],
     ).fetchdf()
@@ -375,6 +381,10 @@ def get_generation_mix(
     fleet and mixes in negative rows. Set include_purchases=True to get them
     as separate rows, split by the energy_source and owned_energy_source
     columns.
+
+    Owned rows are not sign-clean either: storage consumes more than it
+    returns, so its net generation is negative on the owned basis as well. A
+    negative Storage row in a default result is the data, not an error.
 
     Where utilities file a joint IRP, RMI carries one emissions target row
     covering all of them while this table keeps them separate, so the same name
@@ -487,7 +497,8 @@ def get_generation_mix(
             technology_rmi,
             count(DISTINCT utility_name) AS utilities,
         """
-        order_by = "year, net_generation_twh DESC"
+        grain = ["year", "technology_rmi"]
+        order_by = f"year, net_generation_twh DESC, {', '.join(grain)}"
     else:
         dimensions = """
             utility_name,
@@ -497,7 +508,11 @@ def get_generation_mix(
             energy_source,
             owned_energy_source,
         """
-        order_by = "year, owned_energy_source DESC, net_generation_twh DESC"
+        grain = ["utility_name", "parent_name", "year", "technology_rmi", "energy_source"]
+        order_by = (
+            "year, owned_energy_source DESC, net_generation_twh DESC, "
+            + ", ".join(grain)
+        )
 
     df = db.execute(
         f"""
@@ -518,6 +533,21 @@ def get_generation_mix(
     ).fetchdf()
 
     if df.empty:
+        # A joint filing entity names no single operating utility, so the name
+        # the emissions tools report back matches nothing here — the case
+        # match_irp_entity exists for. Name that retry rather than send the
+        # caller off to fix a name that was never wrong.
+        if composites and not match_irp_entity:
+            return fail(
+                f"'{utility_name}' is a joint IRP filing entity, so it names no "
+                f"single utility in the generation data. Retry with "
+                f"match_irp_entity=True to cover the operating utilities behind "
+                f"it ({', '.join(repr(c) for c in components)}), or search for "
+                f"one of them by name.",
+                composite_entities=composites,
+                components=components,
+                retry_with={"match_irp_entity": True},
+            )
         return no_name_match(
             utility_name, "operations_emissions_by_tech", OPERATIONS_NAME_COLUMNS
         )
@@ -574,11 +604,6 @@ def get_generation_mix(
         )
         if excluded:
             notes.append(excluded)
-    grain = (
-        ["year", "technology_rmi"]
-        if group_by == "technology"
-        else ["utility_name", "parent_name", "year", "technology_rmi", "energy_source"]
-    )
     return respond(df, grain=grain, meta=meta, notes=notes)
 
 
@@ -683,12 +708,10 @@ def get_climate_alignment(
             -- Intensity is what the pathway is built from: RMI ramps each
             -- utility down from its own 2005 kg/MWh. Two utilities can carry
             -- the same MMT gap off benchmarks an order of magnitude apart.
-            CASE WHEN net_generation_mwh > 0
-                 THEN emissions_co2 * 1e9 / net_generation_mwh
-                 END AS co2_intensity_kg_mwh,
-            CASE WHEN net_generation_mwh_1point5c > 0
-                 THEN emissions_co2_1point5c * 1e9 / net_generation_mwh_1point5c
-                 END AS co2_intensity_1point5c_kg_mwh,
+            {intensity_kg_mwh("emissions_co2", "net_generation_mwh")}
+                AS co2_intensity_kg_mwh,
+            {intensity_kg_mwh("emissions_co2_1point5c", "net_generation_mwh_1point5c")}
+                AS co2_intensity_1point5c_kg_mwh,
             CASE WHEN emissions_co2_1point5c > 0
                   AND NOT list_contains(comparability_flags, 'low_pathway_intensity')
                  THEN 100 * (emissions_co2 / emissions_co2_1point5c - 1)
@@ -699,7 +722,7 @@ def get_climate_alignment(
                 ELSE 'at or below pathway'
             END AS status
         FROM t
-        ORDER BY owned_delivered, year
+        ORDER BY owned_delivered, year, utility_name
     """,
         [*name_params(TARGET_NAME_COLUMNS, utility_name), *year_params],
     ).fetchdf()
@@ -725,7 +748,9 @@ def get_climate_alignment(
 
     # Surfaced here as well as in rank_climate_alignment, so asking about one
     # utility raises the same caveat a ranking would have applied to it.
-    caveats = caveat_notes([f for flags in df["comparability_flags"] for f in flags])
+    caveats = caveat_notes(
+        sorted({f for flags in df["comparability_flags"] for f in flags})
+    )
     if caveats:
         notes.append(
             note(
@@ -897,6 +922,11 @@ def rank_climate_alignment(
             available_years=[low, high],
         )
 
+    # Fixed row order before anything aggregates. The rollup below sums floats,
+    # and float addition is not associative, so totals depend on the order rows
+    # arrive in — which is scan order until it is pinned here.
+    df = df.sort_values(["name", "utility_name_irp"]).reset_index(drop=True)
+
     df["comparability_flags"] = df["comparability_flags"].apply(list)
     df["blocking"] = df["comparability_flags"].apply(
         lambda flags: sorted(set(flags) & _EXCLUDING_FLAGS)
@@ -967,8 +997,11 @@ def rank_climate_alignment(
         grouped["co2_intensity_kg_mwh"] - grouped["co2_intensity_1point5c_kg_mwh"]
     )
 
+    # `name` is the grain, so ending the sort on it makes the order total.
+    # It stays ascending whichever way the metric runs — a tiebreaker that
+    # flipped with the metric would just be a second arbitrary order.
     ranked = grouped.sort_values(
-        metric, ascending=ascending, na_position="last"
+        [metric, "name"], ascending=[ascending, True], na_position="last"
     ).head(limit)
     # Every other tool calls this column utility_name; a ranking is not a
     # reason for the caller to key its join differently.
@@ -1002,7 +1035,7 @@ def rank_climate_alignment(
                 :MAX_LISTED_MATCHES
             ],
             "caveats": caveat_notes(
-                [f for flags in flagged["blocking"] for f in flags]
+                sorted({f for flags in flagged["blocking"] for f in flags})
             ),
             "reporting_guidance": (
                 "Name these utilities and the reason they were set aside when "
