@@ -796,6 +796,7 @@ def rank_climate_alignment(
     utility_type: str = "",
     min_emissions_mmt: float = 0.0,
     scope: str = "comparable",
+    state_abbr: str = "",
     ascending: bool = False,
     limit: int = 20,
 ) -> dict:
@@ -824,6 +825,15 @@ def rank_climate_alignment(
     Every row carries `comparability_flags` whichever is chosen. Narrow further
     with `utility_type` (matches utility_type_rmi, e.g. 'Vertically Integrated')
     and `min_emissions_mmt`.
+
+    `state_abbr` (two-letter, e.g. 'WI') keeps utilities that own generating
+    capacity in that state — the same population list_utilities(state_abbr=...)
+    would name, joined here by exact utility name. emissions_targets has no
+    state column of its own, and a handful of utilities file one IRP jointly
+    across states under a single combined name (see the `joint_filing`
+    comparability flag) — those rows carry no state that can be resolved this
+    way and are silently absent from every state's results, not misattributed
+    to the wrong one.
     """
     db = get_db()
 
@@ -869,6 +879,23 @@ def rank_climate_alignment(
         type_filter = "AND lower(e.utility_type_rmi) LIKE ?"
         type_params = [f"%{utility_type.strip().lower()}%"]
 
+    state_abbr = state_abbr.strip().upper()
+    state_filter, state_params = "", []
+    if state_abbr:
+        # Name join, not id: emissions_targets carries utility_name_irp, not
+        # utility_id_eia. Exact match only — a fuzzy one would risk pulling in
+        # a same-named subsidiary from a different state.
+        state_filter = """
+            AND e.utility_name_irp IN (
+                SELECT DISTINCT ui.utility_name
+                FROM utility_state_map m
+                JOIN utility_information ui
+                  ON ui.utility_id_eia = m.utility_id_eia
+                WHERE upper(m.state_abbr) = ?
+            )
+        """
+        state_params = [state_abbr]
+
     # Grain is one row per (group, utility): flags belong to a utility, so the
     # filter has to run before the roll-up to a parent, not after.
     df = db.execute(
@@ -899,6 +926,7 @@ def rank_climate_alignment(
               AND c.year = e.year
         WHERE e.owned_delivered = ? AND e.year = ?
         {type_filter}
+        {state_filter}
         GROUP BY e.{group_column}, e.utility_name_irp
         HAVING sum(coalesce(
                    e.emissions_co2_historical,
@@ -907,7 +935,7 @@ def rank_climate_alignment(
                )) IS NOT NULL
            AND sum(e.emissions_co2_1point5c) IS NOT NULL
         """,
-        [basis, year, *type_params],
+        [basis, year, *type_params, *state_params],
     ).fetchdf()
 
     if df.empty:
@@ -918,6 +946,7 @@ def rank_climate_alignment(
         return fail(
             f"No {basis} rows for {year}"
             + (f" matching utility_type {utility_type!r}" if utility_type else "")
+            + (f" in state {state_abbr!r}" if state_abbr else "")
             + f". Data runs {low}-{high}.",
             available_years=[low, high],
         )
@@ -1019,7 +1048,22 @@ def rank_climate_alignment(
         "order": "ascending" if ascending else "descending",
         "candidates": int(candidates),
     }
+    if state_abbr:
+        meta["state_abbr"] = state_abbr
     notes = []
+    if state_abbr:
+        notes.append(
+            note(
+                "state_filter",
+                f"Kept utilities that own generating capacity in {state_abbr}, "
+                "joined from emissions_targets.utility_name_irp by exact name "
+                "match against list_utilities' own crosswalk. A utility that "
+                "files one IRP jointly across multiple states under a single "
+                "combined name (see the joint_filing comparability flag) has "
+                "no state this filter can resolve and is absent here rather "
+                "than attributed to the wrong state.",
+            )
+        )
     if (ranked["source"] != "historical").any():
         notes.append(
             note(
