@@ -1,0 +1,86 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  BASE: https://utilitytransitionhub.rmi.org/static/data_download
+
+jobs:
+  code:
+    name: code (no data)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --dev
+      - run: uv run pytest -q -m "not data and not drift"
+
+  data:
+    name: data
+    runs-on: ubuntu-latest
+    outputs:
+      pt1: ${{ steps.probe.outputs.pt1 }}
+      pt2: ${{ steps.probe.outputs.pt2 }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --dev
+
+      # RMI's own content hash, so the key cannot go stale and a changed key is
+      # itself the refresh event.
+      - id: probe
+        name: Probe RMI ETags
+        run: |
+          for n in 1 2; do
+            printf 'pt%s=%s\n' "$n" "$(curl -fsSI "$BASE/data_download_all_pt_$n.zip" \
+              | tr -d '\r' | awk -F': ' 'tolower($1)=="etag"{print $2}')" >> "$GITHUB_OUTPUT"
+          done
+
+      - uses: actions/cache@v4
+        id: cache
+        with:
+          path: utility_hub.duckdb
+          key: uth-${{ steps.probe.outputs.pt1 }}-${{ steps.probe.outputs.pt2 }}
+
+      - name: Download RMI data
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p data && cd data
+          curl -fLO "$BASE/data_download_all_pt_1.zip" -O "$BASE/data_download_all_pt_2.zip"
+          unzip -q -o -j 'data_download_all_pt_*.zip' && rm -f ./*.zip
+
+      - name: Build DuckDB
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: uv run python -c "from rmi_mcp_uth.db import get_db; get_db()"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: utility-hub-duckdb
+          path: utility_hub.duckdb
+          retention-days: 1
+
+      - run: uv run pytest -q -m "data and not drift"
+
+  drift:
+    name: drift (informational)
+    needs: data
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --dev
+      - uses: actions/download-artifact@v4
+        with:
+          name: utility-hub-duckdb
+      - run: uv run pytest -q -m "drift"
