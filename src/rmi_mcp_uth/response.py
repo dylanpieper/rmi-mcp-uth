@@ -66,7 +66,14 @@ UNITS = {
     "co2_intensity_1point5c_kg_mwh": "kg CO2/MWh",
     "intensity_gap_kg_mwh": "kg CO2/MWh",
     # ratios, as fractions of 1 unless the name says percent
-    "capacity_factor": "fraction",
+    #
+    # capacity_factor is a true fraction only where a tool recomputes it from
+    # summed generation over summed potential. RMI's per-generator column is
+    # not bounded to [0, 1] — it goes negative where net generation does, and
+    # above 1 where reported output exceeds the derived potential — and
+    # preview_table and query_data pass that column through unchanged, so the
+    # label has to hold for both.
+    "capacity_factor": "fraction (RMI's per-generator column is unbounded)",
     "fraction_owned_utility": "fraction",
     "equity_ratio": "fraction",
     "equity_ratio_realized": "fraction",
@@ -217,8 +224,11 @@ def respond(
     else:
         columns = list(rows[0]) if rows else []
     if grain:
+        # Not an assert: `python -O` strips those, and this is the one claim in
+        # the envelope a caller cannot check for itself.
         missing = [c for c in grain if c not in columns]
-        assert not missing, f"grain names columns that are not in the rows: {missing}"
+        if missing:
+            raise ValueError(f"grain names columns that are not in the rows: {missing}")
     head = {"grain": grain}
     unsummable = non_additive_in(columns)
     if unsummable:
