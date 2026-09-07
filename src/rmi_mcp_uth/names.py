@@ -5,9 +5,9 @@ import re
 from .db import get_db
 
 
-# RMI abbreviates corporate suffixes ("Southern Co.", "Xcel Energy, Inc."), so a
-# literal LIKE on what a user types ("Southern Company") misses. Both the search
-# term and the column are normalized through the same rules before comparing.
+# RMI abbreviates corporate suffixes, so a literal LIKE on the expanded form a
+# user types misses the row. Both the search term and the column are normalized
+# through the same rules before comparing; the pairs below are the whole list.
 _NAME_ABBREVIATIONS = [
     ("company", "co"),
     ("corporation", "corp"),
@@ -39,7 +39,7 @@ def name_predicate(columns: list[str]) -> str:
     """Build an OR'd fuzzy match over several name columns.
 
     Utilities are searchable by their own name or by their parent's, because
-    people ask for "Xcel Energy" when the data files it under a subsidiary.
+    people ask for a parent company that the data files under its subsidiaries.
     """
     return " OR ".join(f"{normalized_column(c)} LIKE ?" for c in columns)
 
@@ -71,10 +71,14 @@ def name_suggestions(
 def name_rank(name_column: str, parent_column: str) -> str:
     """CASE expression scoring a match, lowest first.
 
-    A bare LIKE ranks "Blazing Star Wind Farm, LLC" alongside "Northern States
-    Power Co." for the search "Xcel Energy", because both merely contain the
+    A bare LIKE ranks an operating utility alongside the single-project LLCs
+    that share its parent's name, because all of them merely contain the search
     term somewhere. Exact and prefix hits on the utility's own name come first,
     then the same on the parent's, then everything else.
+
+    Searching a parent name in the current data snapshot shows the problem:
+    "Xcel Energy" matches 3 filing entities in emissions_targets but 7 utility
+    names in the operations tables, most of them project companies.
     """
     name = normalized_column(name_column)
     parent = normalized_column(parent_column)

@@ -2,17 +2,28 @@
 
 # RMI anchors each utility's 1.5C pathway to that utility's own 2005 emissions
 # intensity. For a vertically integrated utility burning coal in 2005 the
-# benchmark is a large number and the gap to it means something. For a
-# restructured wires-only utility whose 2005 default supply happened to be
-# nuclear, the benchmark starts near zero and decays toward it, so buying
-# ordinary grid power reads as a several-hundred-percent overshoot. PECO is the
-# extreme: 76 kg/MWh in 2005 against a fleet median of 774, a 43 kg/MWh
-# benchmark in 2024, and a 698% "overshoot" that describes PJM's generation mix
-# rather than anything PECO owns or decided.
+# benchmark is a large number and the gap to it means something. For a utility
+# whose 2005 default supply was already low-carbon, the benchmark starts near
+# zero and decays toward it, so buying ordinary grid power reads as a
+# several-hundred-percent overshoot of a fleet it does not own and did not
+# choose. The flags below mark the utility-years where that comparison breaks
+# down.
 #
-# These flags mark the utility-years where that comparison breaks down. They are
-# deliberately narrow — of the 176 utilities with 2024 delivered data, 6 have a
-# pathway intensity under 100 kg/MWh and 4 a 2005 baseline under 150.
+# They are deliberately narrow. Measured on the current data snapshot: of 164
+# utilities with 2024 delivered data, 5 carry a pathway intensity under 100
+# kg/MWh and 4 a 2005 baseline under 150, against a fleet median 2005 intensity
+# of 653 kg/MWh. Those four, with 2005 intensity, 2024 benchmark, and the
+# percentage overshoot the benchmark produces:
+#
+#   Peco Energy Co.               76 -> 43 kg/MWh    698%
+#   Niagara Mohawk Power Corp.   129 -> 73 kg/MWh    203%
+#   Green Mountain Power Corp.   120 -> 67 kg/MWh    141%
+#   PUD No 2 of Grant County      98 -> 55 kg/MWh     43%
+#
+# The overshoot describes the regional grid mix these utilities buy from, not a
+# fleet they operate. Utilities with a high 2005 baseline can sit well above the
+# pathway too, and that is a real finding rather than an artifact, so the flags
+# key on the baseline rather than on the overshoot.
 
 _BASELINE_YEAR = 2005
 _LOW_BASELINE_KG_MWH = 150.0

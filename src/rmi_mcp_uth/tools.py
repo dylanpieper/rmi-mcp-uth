@@ -5,6 +5,7 @@ import duckdb
 from .comparability import CAVEATS, caveat_notes, comparability_cte
 from .config import mcp
 from .db import get_db
+from .entities import composite_entities, split_composite
 from .helpers import (
     MAX_LISTED_MATCHES,
     MAX_RESPONSE_ROWS,
@@ -55,7 +56,7 @@ def list_tables() -> dict:
                than guessing from the unit.
       notes  — whole-response warnings, each with a `kind`: projection,
                excluded_by_default, not_comparable, below_min_emissions,
-               truncated. Read these before quoting a number.
+               entity_scope, truncated. Read these before quoting a number.
       error  — null, or a message plus fields naming how to narrow the request.
                When it is set, rows is empty.
     """
@@ -347,6 +348,7 @@ def get_generation_mix(
     year: int = 0,
     include_purchases: bool = False,
     group_by: str = "utility",
+    match_irp_entity: bool = False,
 ) -> dict:
     """Get electricity generation breakdown by technology for a utility.
 
@@ -374,6 +376,13 @@ def get_generation_mix(
     as separate rows, split by the energy_source and owned_energy_source
     columns.
 
+    Where utilities file a joint IRP, RMI carries one emissions target row
+    covering all of them while this table keeps them separate, so the same name
+    can mean a wider fleet in get_emissions_trend than it does here. Whenever
+    that happens the response says so in an `entity_scope` note naming the
+    components; pass match_irp_entity=True to widen this result to the filing
+    entity's scope before comparing the two tools.
+
     The search is case-insensitive and supports partial names.
     Optionally filter to a single year; defaults to every year in the data.
     """
@@ -383,7 +392,21 @@ def get_generation_mix(
     if group_by not in ("utility", "technology"):
         return fail("group_by must be one of: utility, technology")
 
+    # Jointly filed IRP entities cover several operating utilities under one
+    # name, so emissions_targets answers at a wider scope than this table does
+    # for the same search. Reported always; matched only on request, since this
+    # table genuinely holds those utilities separately and a caller who asked
+    # for one should get one. See entities.py for the cases and the evidence.
+    composites = composite_entities(db, utility_name)
+    components = sorted({c for names in composites.values() for c in names})
+
+    name_match = name_predicate(OPERATIONS_NAME_COLUMNS)
     params: list = name_params(OPERATIONS_NAME_COLUMNS, utility_name)
+    if components and match_irp_entity:
+        placeholders = ", ".join(["?"] * len(components))
+        name_match += f" OR utility_name IN ({placeholders})"
+        params.extend(components)
+
     owned_filter = "" if include_purchases else "AND owned_energy_source"
     year_filter = ""
     if year:
@@ -391,21 +414,21 @@ def get_generation_mix(
         params.append(year)
 
     where_sql = f"""
-        WHERE ({name_predicate(OPERATIONS_NAME_COLUMNS)})
+        WHERE ({name_match})
         {owned_filter}
         {year_filter}
     """
     # Same clause minus the implicit owned filter, for reporting who it cut.
     # owned_filter binds no parameters, so both share `params` unchanged.
     name_year_where = f"""
-        WHERE ({name_predicate(OPERATIONS_NAME_COLUMNS)})
+        WHERE ({name_match})
         {year_filter}
     """
 
     # Size follows the rows that survive the filters, not the arguments that
     # were passed, so measure it rather than inferring it: a year pins one
-    # dimension but says nothing about the others, and 'Energy' in 2023 is a
-    # single year across 1,006 utilities. Refuse rather than truncate — rows
+    # dimension but says nothing about the others: a common word pinned to one
+    # year still spans a thousand-odd utilities. Refuse rather than truncate — rows
     # are ordered by year, so a cut would silently drop the most recent data,
     # the part the caller almost certainly wanted.
     #
@@ -510,9 +533,30 @@ def get_generation_mix(
 
     meta = matched_names_meta(utility_name, matched)
     notes = []
+    if composites:
+        # A component with no generation rows of its own cannot be recovered
+        # by widening, and the emissions figure stays the larger of the two
+        # however this is called. Say so rather than promise a parity that
+        # will not arrive.
+        unresolved = {
+            entity: len(split_composite(entity)) - len(found)
+            for entity, found in composites.items()
+            if len(found) < len(split_composite(entity))
+        }
+        meta["composite_entities"] = composites
+        meta["matched_irp_entity"] = bool(match_irp_entity)
+        if unresolved:
+            meta["components_absent_from_generation"] = unresolved
+        notes.append(
+            note(
+                "entity_scope",
+                _composite_message(match_irp_entity, bool(unresolved)),
+                entities=composites,
+            )
+        )
     if not include_purchases:
-        # A name can resolve to subsidiaries that own no generation at all —
-        # every Exelon delivery utility, say. They are correctly absent from
+        # A name can resolve to subsidiaries that own no generation at all,
+        # as a parent's delivery-only arms are. They are correctly absent from
         # the numbers, but a caller comparing two parents needs to be told,
         # or a partial fleet reads as the whole one.
         excluded = excluded_note(
@@ -536,6 +580,35 @@ def get_generation_mix(
         else ["utility_name", "parent_name", "year", "technology_rmi", "energy_source"]
     )
     return respond(df, grain=grain, meta=meta, notes=notes)
+
+
+def _composite_message(widened: bool, incomplete: bool) -> str:
+    """Wording for the entity_scope note, by what widening can actually deliver."""
+    if incomplete:
+        return (
+            "RMI files one emissions target row jointly for these operating "
+            "utilities, and at least one of them owns no generation reported "
+            "here. The emissions figure therefore covers a wider fleet than "
+            "this result can, whether or not match_irp_entity is set — see "
+            "meta.components_absent_from_generation."
+        )
+    if widened:
+        return (
+            "Widened to every operating utility behind the joint IRP filing, "
+            "so this covers the same fleet as get_emissions_trend for the same "
+            "name. Rows stay split by utility_name. The two reconcile "
+            "numerically on the owned basis, where RMI built the joint row by "
+            "summing exactly these utilities; on the delivered basis they "
+            "still will not, because delivered emissions follow power sold "
+            "rather than generated."
+        )
+    return (
+        "RMI files one emissions target row jointly for these operating "
+        "utilities, so get_emissions_trend for this name covers all of them "
+        "while this result covers only what the name matched in the generation "
+        "data. Pass match_irp_entity=True to widen this to the same scope "
+        "before comparing the two."
+    )
 
 
 @mcp.tool

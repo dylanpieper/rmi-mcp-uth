@@ -74,9 +74,10 @@ def history_split(df) -> tuple[dict, list[dict]]:
 def matched_names_meta(utility_name: str, matched: list[str]) -> dict:
     """Meta naming which utilities a fuzzy search actually resolved to.
 
-    A parent name can match dozens of subsidiaries; without this the caller has
-    to scan every row to notice that "Xcel Energy" spans three utilities, or
-    cannot see it at all once a rollup drops the utility_name column.
+    A parent name can match dozens of subsidiaries, and how many depends on the
+    table being searched. Without this the caller has to scan every row to
+    notice the spread, or cannot see it at all once a rollup drops the
+    utility_name column.
     """
     matched = sorted(matched)
     meta = {
