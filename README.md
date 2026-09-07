@@ -70,7 +70,7 @@ The server uses the stdio transport, and any MCP client can connect to it. See y
 | `get_emissions_trend` | Show CO2 emissions over time for a utility. `start_year` and `end_year` limit the range. |
 | `get_generation_mix` | Show the generation breakdown by `technology_rmi`. `group_by="technology"` combines the subsidiaries of a parent into one fleet. `match_irp_entity=True` widens the match to every operating utility behind a joint IRP filing. |
 | `get_climate_alignment` | Compare the actual CO2 to the 1.5°C pathway. `start_year` and `end_year` limit the range. |
-| `rank_climate_alignment` | Rank utilities or parents by distance from the 1.5°C pathway. Excludes the utilities whose benchmark makes the comparison meaningless, and says which. |
+| `rank_climate_alignment` | Rank utilities or parents by distance from the 1.5°C pathway. Excludes the utilities whose benchmark makes the comparison meaningless, and says which. `scope` picks the population: `"comparable"` (default), `"all"`, or `"flagged"` to inspect what was cut. |
 | `query_data` | Run read-only SQL in DuckDB syntax |
 
 ### Response Format

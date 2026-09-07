@@ -25,6 +25,8 @@
 # pathway too, and that is a real finding rather than an artifact, so the flags
 # key on the baseline rather than on the overshoot.
 
+from .entities import COMPOSITE_SEPARATORS
+
 _BASELINE_YEAR = 2005
 _LOW_BASELINE_KG_MWH = 150.0
 _LOW_PATHWAY_KG_MWH = 100.0
@@ -66,7 +68,27 @@ CAVEATS = {
         "Net generation is zero, negative, or missing for this year, so "
         "intensity is undefined."
     ),
+    "joint_filing": (
+        "Several operating utilities file one IRP together, so this row covers "
+        "a larger fleet than a single utility does. Ranked against single "
+        "utilities it competes partly on being more than one of them, and its "
+        "components are carried separately in the operations tables."
+    ),
 }
+
+
+def _joint_filing_predicate(column: str) -> str:
+    """SQL truth test for a name that joins several entities into one filing.
+
+    Read off the name rather than a list of known entities, so a new joint
+    filer is caught without a code change. Shares COMPOSITE_SEPARATORS with
+    entities.py, which splits the same names into their components.
+    """
+    # Separators carry their own surrounding spaces on purpose: bare "and" is a
+    # substring of ordinary place names.
+    return " OR ".join(
+        f"{column} LIKE '%{sep}%'" for sep in COMPOSITE_SEPARATORS
+    )
 
 
 def comparability_cte() -> str:
@@ -77,6 +99,7 @@ def comparability_cte() -> str:
     pro-rated row set per owner, so reading a single parent's row as the
     utility's total understates it (see trap 3 in the data dictionary).
     """
+    joint = _joint_filing_predicate("s.utility_name_irp")
     return f"""
     targets_by_utility AS (
         SELECT
@@ -161,7 +184,9 @@ def comparability_cte() -> str:
                 CASE WHEN br.series_break = 1 THEN 'series_break' END,
                 CASE WHEN br.load_shift = 1 THEN 'load_base_shift' END,
                 CASE WHEN s.co2 IS NOT NULL AND coalesce(s.mwh, 0) <= 0
-                     THEN 'invalid_generation' END
+                     THEN 'invalid_generation' END,
+                CASE WHEN {joint}
+                     THEN 'joint_filing' END
             ], x -> x IS NOT NULL) AS comparability_flags
         FROM basis_series s
         LEFT JOIN owned_co2 o

@@ -770,7 +770,7 @@ def rank_climate_alignment(
     group_by: str = "utility",
     utility_type: str = "",
     min_emissions_mmt: float = 0.0,
-    include_flagged: bool = False,
+    scope: str = "comparable",
     ascending: bool = False,
     limit: int = 20,
 ) -> dict:
@@ -787,13 +787,18 @@ def rank_climate_alignment(
     `group_by` is 'utility' or 'parent'.
 
     Utilities whose pathway comparison is not meaningful are excluded by
-    default and named in `notes` with the reason; under
-    group_by='parent' they are dropped before the parent is totalled, so one
-    wires-only subsidiary cannot disqualify its whole parent. Pass
-    include_flagged=True to rank them anyway; every row carries
-    `comparability_flags` either way. Narrow further with `utility_type`
-    (matches utility_type_rmi, e.g. 'Vertically Integrated') and
-    `min_emissions_mmt`.
+    default and named in `notes` with the reason; under group_by='parent' they
+    are dropped before the parent is totalled, so one wires-only subsidiary
+    cannot disqualify its whole parent.
+
+    `scope` chooses which population to rank, and the caveats travel with the
+    response in every case:
+      "comparable" (default) — only utilities the comparison holds for
+      "all"                  — every utility, flagged ones included
+      "flagged"              — only the flagged ones, to inspect what was cut
+    Every row carries `comparability_flags` whichever is chosen. Narrow further
+    with `utility_type` (matches utility_type_rmi, e.g. 'Vertically Integrated')
+    and `min_emissions_mmt`.
     """
     db = get_db()
 
@@ -811,6 +816,16 @@ def rank_climate_alignment(
     group_by = group_by.strip().lower()
     if group_by not in ("utility", "parent"):
         return fail("group_by must be 'utility' or 'parent'.")
+    scope = scope.strip().lower()
+    if scope not in ("comparable", "all", "flagged"):
+        return fail(
+            "scope must be one of: comparable (default), all, flagged.",
+            scopes={
+                "comparable": "Only utilities the 1.5C comparison holds for.",
+                "all": "Every utility, including those carrying caveats.",
+                "flagged": "Only the utilities excluded from 'comparable'.",
+            },
+        )
 
     limit = max(1, min(limit, 100))
     group_column = "utility_name_irp" if group_by == "utility" else "parent_name"
@@ -888,13 +903,23 @@ def rank_climate_alignment(
     )
     candidates = df["name"].nunique()
     flagged = df[df["blocking"].apply(bool)]
-    if not include_flagged:
+    if scope == "comparable":
         df = df[~df["blocking"].apply(bool)]
+    elif scope == "flagged":
+        df = df[df["blocking"].apply(bool)]
 
     if df.empty:
+        if scope == "flagged":
+            return fail(
+                f"No {basis} utility in {year} carries a comparability flag, so "
+                f"there is nothing for scope='flagged' to show. The default "
+                f"scope ranks all {candidates} of them.",
+                candidates=int(candidates),
+            )
         return fail(
             f"Every {basis} utility in {year} carries a comparability flag. "
-            f"Pass include_flagged=True to rank them anyway.",
+            f"Pass scope='all' to rank them anyway, or scope='flagged' to "
+            f"inspect them with their caveats.",
             flags=sorted({f for flags in flagged["blocking"] for f in flags}),
         )
 
@@ -957,6 +982,7 @@ def rank_climate_alignment(
         "metric": metric,
         "metric_note": _RANK_METRICS[metric],
         "group_by": group_by,
+        "scope": scope,
         "order": "ascending" if ascending else "descending",
         "candidates": int(candidates),
     }
@@ -978,10 +1004,17 @@ def rank_climate_alignment(
             "caveats": caveat_notes(
                 [f for flags in flagged["blocking"] for f in flags]
             ),
+            "reporting_guidance": (
+                "Name these utilities and the reason they were set aside when "
+                "reporting this ranking — a ranking that silently omits part of "
+                "its population reads as complete. Then ask whether any of them "
+                "should be ranked alongside the rest (scope='all'), examined on "
+                "their own (scope='flagged'), or left out."
+            ),
         }
         if flagged["utility_name_irp"].nunique() > MAX_LISTED_MATCHES:
             detail["truncated"] = True
-        if group_by == "parent" and not include_flagged:
+        if group_by == "parent" and scope == "comparable":
             detail["parent_totals_note"] = (
                 "Parent totals cover only the subsidiaries that survived this "
                 "filter, so they understate the parent's full book. The "
@@ -990,10 +1023,7 @@ def rank_climate_alignment(
         notes.append(
             note(
                 "not_comparable",
-                "Excluded before the ranking; the 1.5C comparison is not "
-                "meaningful for these. Pass include_flagged=True to rank them."
-                if not include_flagged
-                else "Ranked, but the 1.5C comparison is not meaningful for these.",
+                _scope_message(scope),
                 **detail,
             )
         )
@@ -1011,6 +1041,22 @@ def rank_climate_alignment(
         grain=["utility_name" if group_by == "utility" else "parent_name"],
         meta=meta,
         notes=notes,
+    )
+
+
+def _scope_message(scope: str) -> str:
+    """How to read the flagged utilities, given which population was ranked."""
+    if scope == "flagged":
+        return (
+            "This ranking contains ONLY utilities whose 1.5C comparison is not "
+            "meaningful. Every row below carries a caveat; read them with it."
+        )
+    if scope == "all":
+        return "Ranked, but the 1.5C comparison is not meaningful for these."
+    return (
+        "Excluded before the ranking; the 1.5C comparison is not meaningful "
+        "for these. Pass scope='all' to rank them alongside the rest, or "
+        "scope='flagged' to inspect them on their own."
     )
 
 
