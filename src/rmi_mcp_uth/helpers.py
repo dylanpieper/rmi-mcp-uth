@@ -24,14 +24,14 @@ def basis_filter(basis: str) -> str | None:
 
 MAX_LISTED_MATCHES = 25
 
-# One row budget for every tool. A parent name crossed with 20 years of
-# per-subsidiary rows reaches ~1,350 rows / ~490 KB — roughly 165k tokens, a
-# whole context window for a single call, and no question is better answered by
-# that than by an aggregate.
+# Row budget shared by every tool. Worst case: a parent name crossed with
+# 20 years of per-subsidiary rows hits ~1,350 rows (~490 KB, ~165k tokens) —
+# most of a 200k-token context window for one call, and an aggregate always
+# answers that question better than a row dump would.
 #
-# Set above the technology rollup's ceiling (20 years x 11 technology_rmi values
-# = 220 rows) so the aggregate a refusal points at can never itself be refused.
-# That ceiling grows by ~11 rows for each new year of data.
+# Set above the technology rollup's ceiling (20 years x 11 technology_rmi
+# values = 220 rows), so the aggregate a refusal points to is never itself
+# over budget. That ceiling grows ~11 rows per new year of data.
 MAX_RESPONSE_ROWS = 300
 
 
