@@ -22,6 +22,17 @@ def basis_filter(basis: str) -> str | None:
         "all": "",
     }.get(basis.strip().lower())
 
+def intensity_kg_mwh(co2_column: str, mwh_column: str) -> str:
+    """SQL for emissions intensity in kg CO2/MWh, undefined where load is not positive.
+
+    One definition, shared by every caller. Generation can be zero or negative
+    in this data, and a non-positive denominator makes intensity meaningless
+    rather than merely large, so it yields NULL. Two sites computing this
+    independently is how the flag and the reported number drift apart.
+    """
+    return f"CASE WHEN {mwh_column} > 0 THEN {co2_column} * 1e9 / {mwh_column} END"
+
+
 MAX_LISTED_MATCHES = 25
 
 # Row budget shared by every tool. Worst case: a parent name crossed with

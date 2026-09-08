@@ -3,15 +3,16 @@
 __pycache__/
 *.py[cod]
 
-# RMI source data — download from utilitytransitionhub.rmi.org (see README)
+# RMI source data 
 data/
 
-# Built DuckDB database — rebuilt from CSVs on first run
+# DuckDB database
 *.duckdb
-
-.DS_Store
 
 # Secrets
 .env
 .env.*
 !.env.example
+
+# MacOS
+.DS_Store

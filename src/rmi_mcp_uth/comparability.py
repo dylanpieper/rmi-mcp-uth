@@ -26,6 +26,7 @@
 # key on the baseline rather than on the overshoot.
 
 from .entities import COMPOSITE_SEPARATORS
+from .helpers import intensity_kg_mwh
 
 _BASELINE_YEAR = 2005
 _LOW_BASELINE_KG_MWH = 150.0
@@ -116,9 +117,8 @@ def comparability_cte() -> str:
     basis_series AS (
         SELECT
             *,
-            CASE WHEN mwh > 0 THEN co2 * 1e9 / mwh END AS kg_mwh,
-            CASE WHEN mwh_1point5c > 0
-                 THEN co2_1point5c * 1e9 / mwh_1point5c END AS pathway_kg_mwh
+            {intensity_kg_mwh("co2", "mwh")} AS kg_mwh,
+            {intensity_kg_mwh("co2_1point5c", "mwh_1point5c")} AS pathway_kg_mwh
         FROM targets_by_utility
     ),
     owned_co2 AS (

@@ -23,3 +23,21 @@ build-backend = "uv_build"
 
 [tool.uv.build-backend]
 module-name = "rmi_mcp_uth"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+# Both must be "session". The client fixture is session-scoped, and awaiting it
+# from a function-scoped test loop deadlocks rather than erroring.
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
+markers = [
+    "data: reads the built DuckDB",
+    "drift: coverage pins and calibration against the current snapshot",
+]

@@ -1,4 +1,10 @@
-"""DuckDB connection, built from the RMI CSVs on first run."""
+"""DuckDB connections, built from the RMI CSVs on first run.
+
+Two policies, deliberately different, because the two jobs need different
+powers. Ingest reads CSVs off disk and writes tables; serving reads one database
+file and nothing else. Keeping them apart means the permissive one exists only
+while the build runs.
+"""
 
 import duckdb
 
@@ -8,20 +14,46 @@ from .config import DATA_DIR, DB_PATH
 _DB: duckdb.DuckDBPyConnection | None = None
 
 
+# Reading the RMI CSVs is external file access, so ingest must allow it, and
+# creating tables means it cannot be read-only. Short-lived by design: it is
+# opened for the build and closed before anything serves a query.
+INGEST_CONFIG: dict = {}
+
+# What every tool and every query_data call runs against.
+#
+# A read-only connection stops writes but not reads: DuckDB lets a plain SELECT
+# reach the filesystem through table functions — read_csv, read_text, glob — and
+# pull in remote data through autoloaded extensions. No tool needs either, and
+# query_data hands the caller arbitrary SELECT, so the serving connection gives
+# up both. These settings are startup-only in DuckDB and cannot be re-enabled by
+# a query, so the restriction holds for the life of the connection rather than
+# depending on the statement check catching every shape.
+SERVE_CONFIG: dict = {
+    "enable_external_access": False,
+    "autoinstall_known_extensions": False,
+    "autoload_known_extensions": False,
+}
+
+
+def connect_serving() -> duckdb.DuckDBPyConnection:
+    """Open the built database read-only, under the serving policy."""
+    return duckdb.connect(str(DB_PATH), read_only=True, config=SERVE_CONFIG)
+
+
 def get_db() -> duckdb.DuckDBPyConnection:
-    """Return a cached read-only DuckDB connection, building it from CSVs if needed."""
+    """Return a cached serving connection, building the database if needed."""
     global _DB
     if _DB is not None:
         return _DB
 
     if DB_PATH.exists():
-        probe = duckdb.connect(str(DB_PATH), read_only=True)
+        probe = connect_serving()
         if probe.execute("SHOW TABLES").fetchall():
             _DB = probe
             return _DB
         probe.close()
 
-    db = duckdb.connect(str(DB_PATH))
+    db = duckdb.connect(str(DB_PATH), config=INGEST_CONFIG)
     print("First run — loading RMI data into DuckDB...")
 
     csv_files = {
@@ -58,5 +90,5 @@ def get_db() -> duckdb.DuckDBPyConnection:
 
     print("Done. Delete utility_hub.duckdb to rebuild.\n")
     db.close()
-    _DB = duckdb.connect(str(DB_PATH), read_only=True)
+    _DB = connect_serving()
     return _DB
